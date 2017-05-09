@@ -49,8 +49,7 @@ struct ScratchWorkspaces {
   std::shared_ptr<Workspace> forwardSharedWs = nullptr;
 };
 
-void UpdateTimestepBlob(Workspace* ws, std::string blob_name, int t) {
-  std::cout << "Create blob " << blob_name << " timestep:" << t << std::endl;
+inline void UpdateTimestepBlob(Workspace* ws, std::string blob_name, int t) {
   ws->CreateBlob(blob_name)->template GetMutable<TensorCPU>()->Resize(1);
   auto timestepBlob = ws->GetBlob(blob_name);
   CAFFE_ENFORCE(timestepBlob);
@@ -189,7 +188,7 @@ class RecurrentNetworkOp final : public Operator<Context> {
     aliases_ = constructAliases();
 
     if (stepNetDef_.type() == "rnn") {
-      LOG(INFO) << "Use RecurrentNetworkExecutor";
+      VLOG(0) << "Use RecurrentNetworkExecutor";
       rnnExecutor_ = caffe2::make_unique<RecurrentNetworkExecutor>(stepNetDef_);
     } else {
       CAFFE_ENFORCE(stepNetDef_.type() != "async_dag");
