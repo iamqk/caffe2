@@ -2,22 +2,28 @@
 
 #include "caffe2/core/context_gpu.h"
 
-#include "gloo/cuda_allreduce_halving_doubling.h"
-#include "gloo/cuda_allreduce_ring.h"
-#include "gloo/cuda_allreduce_ring_chunked.h"
+#include <gloo/cuda_allreduce_halving_doubling.h>
+#include <gloo/cuda_allreduce_ring.h>
+#include <gloo/cuda_allreduce_ring_chunked.h>
 
 namespace caffe2 {
 namespace gloo {
 
 template <typename T, class Context>
-void AllreduceOp<T, Context>::initializeRingFull() {
+void AllreduceOp<T, Context>::initializeHalvingDoubling() {
   algorithm_.reset(new ::gloo::CudaAllreduceHalvingDoubling<T>(
       init_.context, init_.outputs, init_.size));
 }
 
 template <typename T, class Context>
+void AllreduceOp<T, Context>::initializeRingFull() {
+  algorithm_.reset(new ::gloo::CudaAllreduceRing<T>(
+      init_.context, init_.outputs, init_.size));
+}
+
+template <typename T, class Context>
 void AllreduceOp<T, Context>::initializeRingChunked() {
-  algorithm_.reset(new ::gloo::CudaAllreduceHalvingDoubling<T>(
+  algorithm_.reset(new ::gloo::CudaAllreduceRingChunked<T>(
       init_.context, init_.outputs, init_.size));
 }
 

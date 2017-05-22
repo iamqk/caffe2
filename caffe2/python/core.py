@@ -311,7 +311,7 @@ def CreateOperator(
 
 
 def _RegisterPythonImpl(
-    f, grad_f=None, python_func_type=None, pass_workspace=False
+    f, grad_f=None, python_func_type=None, pass_workspace=False, name=None,
 ):
     if python_func_type:
         func = python_func_type(f)
@@ -323,7 +323,7 @@ def _RegisterPythonImpl(
         if isinstance(grad_f, tuple):
             grad_f = grad_f[0](*grad_f[1], **grad_f[2])
 
-    token = C.register_python_op(f, pass_workspace)
+    token = C.register_python_op(f, pass_workspace, name or '')
     if grad_f:
         C.register_python_gradient_op(token, grad_f)
     return token
@@ -335,6 +335,7 @@ def CreatePythonOperator(
     grad_f=None,
     pass_workspace=False,
     python_func_type=None,
+    name=None,
     *args,
     **kwargs
 ):
@@ -347,7 +348,7 @@ def CreatePythonOperator(
     the workspace directly), use on your own risk.
     """
     kwargs["token"] = _RegisterPythonImpl(
-        f, grad_f, python_func_type, pass_workspace=pass_workspace
+        f, grad_f, python_func_type, pass_workspace=pass_workspace, name=name
     )
     return CreateOperator("Python", inputs, outputs, *args, **kwargs)
 
@@ -1809,7 +1810,8 @@ class Net(object):
             registry = _RegisterPythonImpl
 
         token = registry(
-            f, grad_f, python_func_type, pass_workspace=pass_workspace
+            f, grad_f, python_func_type, pass_workspace=pass_workspace,
+            name='%s:%d' % (str(self), len(self.Proto().op))
         )
         return lambda *args, **kwargs: self._CreateAndAddToSelf(
             'Python', token=token, *args, **kwargs)

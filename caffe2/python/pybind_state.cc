@@ -704,12 +704,19 @@ void addGlobalMethods(py::module& m) {
       },
       py::arg("net_def"),
       py::arg("overwrite") = kPyBindFalse);
-  m.def("run_net", [](const std::string& name, int num_iter) {
+  m.def("run_net", [](const std::string& name, int num_iter, bool allow_fail) {
     CAFFE_ENFORCE(gWorkspace);
     CAFFE_ENFORCE(gWorkspace->GetNet(name), "Can't find net ", name);
     py::gil_scoped_release g;
     for (int i = 0; i < num_iter; i++) {
-      CAFFE_ENFORCE(gWorkspace->RunNet(name), "Error running net ", name);
+      bool success = gWorkspace->RunNet(name);
+      if (!allow_fail) {
+        CAFFE_ENFORCE(success, "Error running net ", name);
+      } else {
+        if (!success) {
+          return false;
+        }
+      }
     }
     return true;
   });
@@ -851,16 +858,22 @@ void addGlobalMethods(py::module& m) {
 
   // we support 2 possible signatures of python op: (inputs, outputs) or
   // (inputs, outputs, workspace)
-  m.def("register_python_op", [](py::object func, bool pass_workspace) {
-    using namespace python_detail;
-    CAFFE_ENFORCE(func != py::none());
-    const std::string name = func.attr("__name__").cast<std::string>();
-    // Unique name since registry is never cleared.
-    const std::string token = name + to_string(gRegistery().size());
-    CAFFE_ENFORCE(gRegistery().find(name) == gRegistery().end());
-    gRegistery()[token] = Func{func, pass_workspace};
-    return token;
-  });
+  m.def(
+      "register_python_op",
+      [](py::object func, bool pass_workspace, std::string name) {
+        using namespace python_detail;
+        CAFFE_ENFORCE(func != py::none());
+        if (!name.empty()) {
+          name += ":";
+        }
+        name += func.attr("__name__").cast<std::string>();
+        std::string token = name;
+        for (int i = 1; gRegistery().count(token) > 0; ++i) {
+          token = name + ":" + to_string(i);
+        }
+        gRegistery()[token] = Func{func, pass_workspace};
+        return token;
+      });
 
   m.def(
       "register_python_gradient_op",

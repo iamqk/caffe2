@@ -12,7 +12,7 @@ import time
 import os
 
 from caffe2.python import core, workspace, experiment_util, data_parallel_model, dyndep
-from caffe2.python import timeout_guard, cnn
+from caffe2.python import timeout_guard, model_helper, brew
 
 import caffe2.python.models.resnet as resnet
 import caffe2.python.predictor.predictor_exporter as pred_exp
@@ -36,7 +36,6 @@ passing the `file_store_path` argument. Use the latter by passing the
 `redis_host` and `redis_port` arguments.
 '''
 
-
 logging.basicConfig()
 log = logging.getLogger("resnet50_trainer")
 log.setLevel(logging.DEBUG)
@@ -44,14 +43,15 @@ log.setLevel(logging.DEBUG)
 dyndep.InitOpsLibrary('@/caffe2/caffe2/distributed:file_store_handler_ops')
 dyndep.InitOpsLibrary('@/caffe2/caffe2/distributed:redis_store_handler_ops')
 
+
 def AddImageInput(model, reader, batch_size, img_size):
     '''
     Image input operator that loads data from reader and
     applies certain transformations to the images.
     '''
-    data, label = model.ImageInput(
-        reader,
-        ["data", "label"],
+    data, label = brew.image_input(
+        model,
+        reader, ["data", "label"],
         batch_size=batch_size,
         use_caffe_datum=True,
         mean=128.,
@@ -69,7 +69,7 @@ def AddMomentumParameterUpdate(train_model, LR):
     Add the momentum-SGD update.
     '''
     params = train_model.GetParams()
-    assert(len(params) > 0)
+    assert (len(params) > 0)
 
     for param in params:
         param_grad = train_model.param_to_grad[param]
@@ -86,21 +86,11 @@ def AddMomentumParameterUpdate(train_model, LR):
         )
 
 
-def GetCheckpointParams(train_model):
-    prefix = "gpu_{}".format(train_model._devices[0])
-    params = [str(p) for p in train_model.GetParams(prefix)]
-    params.extend([str(p) + "_momentum" for p in params])
-    params.extend([str(p) for p in train_model.GetComputedParams(prefix)])
-
-    assert len(params) > 0
-    return params
-
-
 def SaveModel(args, train_model, epoch):
     prefix = "gpu_{}".format(train_model._devices[0])
     predictor_export_meta = pred_exp.PredictorExportMeta(
         predict_net=train_model.net.Proto(),
-        parameters=GetCheckpointParams(train_model),
+        parameters=data_parallel_model.GetCheckpointParams(train_model),
         inputs=[prefix + "/data"],
         outputs=[prefix + "/softmax"],
         shapes={
@@ -239,13 +229,15 @@ def Train(args):
     args.epoch_size = epoch_iters * global_batch_size
     log.info("Using epoch size: {}".format(args.epoch_size))
 
-    # Create CNNModeLhelper object
-    train_model = cnn.CNNModelHelper(
-        order="NCHW",
-        name="resnet50",
-        use_cudnn=True,
-        cudnn_exhaustive_search=True,
-        ws_nbytes_limit=(args.cudnn_workspace_limit_mb * 1024 * 1024),
+    # Create ModelHelper object
+    train_arg_scope = {
+        'order': 'NCHW',
+        'use_cudnn': True,
+        'cudnn_exhaustice_search': True,
+        'ws_nbytes_limit': (args.cudnn_workspace_limit_mb * 1024 * 1024),
+    }
+    train_model = model_helper.ModelHelper(
+        name="resnet50", arg_scope=train_arg_scope
     )
 
     num_shards = args.num_shards
@@ -291,13 +283,13 @@ def Train(args):
             no_bias=True,
         )
         loss = model.Scale(loss, scale=loss_scale)
-        model.Accuracy([softmax, "label"], "accuracy")
+        brew.accuracy(model, [softmax, "label"], "accuracy")
         return [loss]
 
     # SGD
     def add_parameter_update_ops(model):
-        model.AddWeightDecay(args.weight_decay)
-        ITER = model.Iter("ITER")
+        brew.add_weight_decay(model, args.weight_decay)
+        ITER = brew.iter(model, "ITER")
         stepsz = int(30 * args.epoch_size / total_batch_size / num_shards)
         LR = model.net.LearningRate(
             [ITER],
@@ -341,11 +333,13 @@ def Train(args):
     test_model = None
     if (args.test_data is not None):
         log.info("----- Create test net ----")
-        test_model = cnn.CNNModelHelper(
-            order="NCHW",
-            name="resnet50_test",
-            use_cudnn=True,
-            cudnn_exhaustive_search=True
+        test_arg_scope = {
+            'order': "NCHW",
+            'use_cudnn': True,
+            'cudnn_exhaustive_search': True,
+        }
+        test_model = model_helper.ModelHelper(
+            name="resnet50_test", arg_scope=test_arg_scope
         )
 
         test_reader = test_model.CreateDB(
@@ -379,11 +373,9 @@ def Train(args):
     # load the pre-trained model and reset epoch
     if args.load_model_path is not None:
         LoadModel(args.load_model_path, train_model)
+
         # Sync the model params
-        data_parallel_model.FinalizeAfterCheckpoint(
-            train_model,
-            GetCheckpointParams(train_model),
-        )
+        data_parallel_model.FinalizeAfterCheckpoint(train_model)
 
         # reset epoch. load_model_path should end with *_X.mdl,
         # where X is the epoch number

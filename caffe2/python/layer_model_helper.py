@@ -132,7 +132,8 @@ class LayerModelHelper(model_helper.ModelHelper):
         self._layers.append(layer)
         for param in layer.get_parameters():
             assert isinstance(param.parameter, core.BlobReference)
-            self.param_to_optim[str(param.parameter)] = param.optimizer
+            self.param_to_optim[str(param.parameter)] = \
+                param.optimizer or self.default_optimizer
 
         # The primary value of adding everything to self.net - generation of the
         # operators right away, i.e. if error happens it'll be detected
@@ -196,6 +197,9 @@ class LayerModelHelper(model_helper.ModelHelper):
         self._loss = loss
 
     def __getattr__(self, layer):
+        if layer.startswith('__'):
+            raise AttributeError(layer)
+
         # TODO(amalevich): Add add support for ifbpy inline documentation
         if layers.layer_exists(layer):
             def wrapper(*args, **kwargs):
@@ -204,19 +208,13 @@ class LayerModelHelper(model_helper.ModelHelper):
             return wrapper
         elif core.IsOperator(layer):
             def wrapper(*args, **kwargs):
-                def apply_operator(net, in_record, out_record):
-                    # core.Net will throw exception if output_dtypes is set
-                    # in Functional layer because MakeArgment() cannot recognize
-                    # it. Just remove it from kwargs.
-                    clean_kwargs = dict(kwargs)
-                    if 'output_dtypes' in clean_kwargs:
-                        del clean_kwargs['output_dtypes']
-
+                def apply_operator(net, in_record, out_record, **kwargs):
                     # TODO(amalevich): Switch to net.operator as soon as it gets
                     # landed
                     net.__getattr__(layer)(in_record.field_blobs(),
                                            out_record.field_blobs(),
-                                           **clean_kwargs)
+                                           **kwargs)
+
                 if 'name' not in kwargs:
                     kwargs['name'] = layer
                 return self.add_layer(
@@ -234,8 +232,8 @@ class LayerModelHelper(model_helper.ModelHelper):
 
     def apply_optimizers(self, train_net, train_init_net, grad_map):
         for param, optimizer in self.param_to_optim.items():
-            if not optimizer:
-                optimizer = self.default_optimizer
+            assert optimizer is not None, \
+                "default optimizer must have been set in add_layer"
             # note that not all params has gradient and thus we sent None if
             # gradient does not exists
             optimizer(
