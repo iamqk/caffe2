@@ -42,9 +42,11 @@ class PredictorExportMeta(collections.namedtuple(
         extra_init_net=None,
         net_type=None,
     ):
-        inputs = map(str, inputs)
-        outputs = map(str, outputs)
-        parameters = map(str, parameters)
+        inputs = [str(i) for i in inputs]
+        outputs = [str(o) for o in outputs]
+        assert len(set(inputs)) == len(inputs), (
+            "All inputs to the predictor should be unique")
+        parameters = [str(p) for p in parameters]
         shapes = shapes or {}
 
         if isinstance(predict_net, (core.Net, core.Plan)):

@@ -24,6 +24,9 @@ class AllreduceOp final : public Operator<Context> {
       : Operator<Context>(operator_def, ws), ws_(ws) {
     status_blob_ =
         OperatorBase::GetSingleArgument<std::string>("status_blob", "");
+    if (status_blob_ != "") {
+      ws_->CreateBlob(status_blob_);
+    }
   }
 
   virtual ~AllreduceOp() {}
@@ -41,7 +44,7 @@ class AllreduceOp final : public Operator<Context> {
     } catch (::gloo::IoException& ioe) {
       LOG(ERROR) << "Caught gloo IO exception: " << ioe.what();
       if (status_blob_ != "") {
-        signalFailure(ws_->CreateBlob(status_blob_), ioe);
+        signalFailure(ws_->GetBlob(status_blob_), ioe);
         return false;
       } else {
         throw ioe;
@@ -57,15 +60,6 @@ class AllreduceOp final : public Operator<Context> {
 
     // Store which inputs/outputs this instance initialized with
     update(init_);
-
-    // Pretty arbitrary threshold but seems to work well.
-    // Logic for switching between algorithms in a topology
-    // dependent manner will eventually move to Gloo itself.
-    if (bytes < (4 * 1024 * 1024) || init_.context->size >= 16) {
-      mode = HALVING_DOUBLING;
-    } else {
-      mode = RING_CHUNKED;
-    }
 
     // Verify inputs == ouputs
     CAFFE_ENFORCE_EQ(init_.inputs.size(), init_.outputs.size());

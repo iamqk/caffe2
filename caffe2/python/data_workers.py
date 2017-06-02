@@ -59,7 +59,11 @@ for each GPU. Note that the 'coordinator' returned by the function is same
 each time.
 '''
 
-import Queue
+try:
+    import Queue
+except ImportError:
+    # Py3
+    import queue as Queue
 import logging
 import threading
 import atexit
@@ -195,10 +199,6 @@ class DataInputCoordinator(object):
                 workspace.RunOperatorOnce(
                     core.CreateOperator("CloseBlobsQueue", [q], [])
                 )
-
-            # Release memory for the scratch blobs
-            if len(self._scratch_blobs) > 0:
-                utils.ResetBlobs(self._scratch_blobs)
             self._started = False
         finally:
             self._log_inputs_per_interval(0, force=True)
@@ -213,6 +213,10 @@ class DataInputCoordinator(object):
             if w.isAlive():
                 print("Worker {} failed to close while waiting".format(w))
                 success = False
+
+        # Release memory for the scratch blobs
+        if success and len(self._scratch_blobs) > 0:
+            utils.ResetBlobs(self._scratch_blobs)
 
         print("All workers terminated: {}".format(success))
         return success
@@ -319,13 +323,14 @@ class DataInputCoordinator(object):
             "_scratch_" + self._input_source_name
         blob = core.BlobReference(scratch_name)
         status = core.BlobReference(scratch_name + "_status")
+        if blob not in self._scratch_blobs:
+            self._scratch_blobs.add(blob)
+            self._scratch_blobs.add(status)
         workspace.FeedBlob(
             blob,
             data_arr,
             device_option=self._device_option
         )
-        self._scratch_blobs.add(blob)
-        self._scratch_blobs.add(status)
 
         op = core.CreateOperator(
             "SafeEnqueueBlobs",

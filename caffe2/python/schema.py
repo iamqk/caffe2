@@ -24,6 +24,7 @@ from caffe2.python import core
 from caffe2.python import workspace
 from caffe2.python.core import BlobReference
 from collections import OrderedDict, namedtuple
+from past.builtins import basestring
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -284,6 +285,8 @@ class Struct(Field):
         fields = [(name, _normalize_field(field)) for name, field in fields]
         self.fields = OrderedDict()
         for name, field in fields:
+            # if name == 'dense':
+            #     import pdb; pdb.set_trace()
             if FIELD_SEPARATOR in name:
                 name, field = self._struct_from_nested_name(name, field)
             if name not in self.fields:
@@ -603,7 +606,7 @@ class Scalar(Field):
                 "on newly created Scalar with unsafe=True. This will become an "
                 "error soon."
             )
-        if blob is not None and isinstance(blob, core.basestring):
+        if blob is not None and isinstance(blob, basestring):
             raise ValueError(
                 'Passing str blob to Scalar.set() is ambiguous. '
                 'Do either set(blob=np.array(blob)) or '
@@ -881,7 +884,7 @@ def as_record(value):
         return value
     elif isinstance(value, list) or isinstance(value, tuple):
         is_field_list = all(
-            f is tuple and len(f) == 2 and isinstance(f[0], core.basestring)
+            f is tuple and len(f) == 2 and isinstance(f[0], basestring)
             for f in value
         )
         if is_field_list:
