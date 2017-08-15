@@ -7,9 +7,21 @@ from __future__ import unicode_literals
 
 from caffe2.python import core, scope, workspace
 from caffe2.python.modeling import parameter_info
+from caffe2.python.modeling.parameter_sharing import (
+    parameter_sharing_context,
+)
+from caffe2.python.optimizer_context import (
+    OptimizerContext,
+    DEFAULT_OPTIM,
+)
+from caffe2.proto import caffe2_pb2
 
+from future.utils import viewitems, viewkeys
+from itertools import chain
 
 import logging
+import six
+
 
 # _known_working_ops are operators that do not need special care.
 _known_working_ops = [
@@ -27,6 +39,7 @@ _known_working_ops = [
     "CopyCPUToGPU",
     "DequeueBlobs",
     "EnsureCPUOutput",
+    "ExpandDims",
     "Flatten",
     "FlattenToVec",
     "LabelCrossEntropy",
@@ -50,6 +63,7 @@ _known_working_ops = [
     "StopGradient",
     "Summarize",
     "Tanh",
+    "Transpose",
     "UnpackSegments",
     "WeightedSum",
     "ReduceFrontSum",
@@ -83,15 +97,16 @@ class ModelHelper(object):
             self.param_init_net = param_model.param_init_net
             self.param_to_grad = param_model.param_to_grad
             self.params = param_model.params
-            self.computed_params = param_model.computed_params
+            self._parameters_info = param_model._parameters_info
+            self._computed_params = param_model._computed_params
         else:
-            self.param_init_net = core.Net(name + '_init')
+            self.param_init_net = core.Net(self.name + '_init')
             self.param_to_grad = {}
             self.params = []
-            self.computed_params = []
+            self._parameters_info = {}
+            self._computed_params = []
 
         self._param_info_deprecated = []
-        self._parameters_info = {}
         self._devices = []
         self.gradient_ops_added = False
         self.init_params = init_params
@@ -128,7 +143,8 @@ class ModelHelper(object):
         assert len(self._param_info_deprecated) <= len(self.params)
         for param in self.params[len(self._param_info_deprecated):]:
             if not isinstance(param, core.BlobReference):
-                raise ValueError("Param %s must be a BlobReference!" % str(param))
+                raise ValueError(
+                    "Param %s must be a BlobReference!" % str(param))
             self._param_info_deprecated.append(parameter_info.ParameterInfo(
                 param_id=len(self._param_info_deprecated),
                 param=param,
@@ -136,13 +152,78 @@ class ModelHelper(object):
         for info in self._param_info_deprecated:
             info.grad = self.param_to_grad.get(info.name)
 
-    def create_param(self, param_name, shape, initializer):
+    def _normalize_tags(self, tags):
+        tags = tags or []
+        return set(tags) if isinstance(tags, list) else set([tags])
+
+    def create_param(self, param_name, shape, initializer, tags=None):
+        """
+        Creates parameter with a given name and initializer.
+
+        If param_name is instance of BlobRefernce - then this blob will be used
+        to store parameter (no any logic will affect it's location).
+
+        If param_name is instance of a string type, then the final blob will
+        be created in the CurrentNameScope with the respect of all parameter
+        sharing logic, i.e. 'resolved_name_scope/param_name'.
+
+        Parameter sharing logic is going to override CurrentNameScope accoring
+        to the rules that are specified through ParameterSharing contexts,
+        all ParameterSharing contexts are applied recursively until there are no
+        extra overrides present, where on each step the best match will be
+        applied first.
+
+        The following examples should clarify the way ParameterSharing logic
+        works:
+
+        As an example if this function is called with parameter 'w':
+        a. Call from some scope 'global_scope' with no Parameter sharing:
+          'global_scope/w'
+        b. Call from scope 'scope_b', with override {'scope_b': 'scope_a'}:
+          'scope_a/w'
+        c. Call from scope 'scope_a', with override {'scope_a': ''}:
+          'scope_a/w'
+        d. Call from scope 'scope_b/shared', with overrides
+          {'scope_b/shared': 'scope_b', 'scope_b': 'scope_a'}:
+          'scope_a/w'
+        d. Call from scope 'scope_b/unshared', with overrides
+          {'scope_b/shared': 'scope_b', 'scope_b': 'scope_a'}:
+          'scope_a/unshared/w'
+        """
+        # ParameterSharing works only for case when param_name is instance of
+        # a string type. If param_name is a BlobReference - no attempt for
+        # ParameterSharing will be applied.
+        if isinstance(param_name, core.BlobReference):
+            param_name = str(param_name)
+        elif isinstance(param_name, six.string_types):
+            # Parameter name will be equal to current Namescope that got
+            # resolved with the respect of parameter sharing of the scopes.
+            param_name = parameter_sharing_context.get_parameter_name(
+                param_name)
+        else:
+            raise "Unsupported type for param_name"
+
+        if param_name in self._parameters_info:
+            assert self._parameters_info[param_name].shape == shape
+            return self._parameters_info[param_name].blob
+
         param_info = initializer.create_param(
-            param_name=param_name,
+            param_name=core.BlobReference(param_name),
             init_net=self.param_init_net,
             shape=shape,
         )
-        self._parameters_info[param_info.blob] = param_info
+        optim_context = OptimizerContext.current()
+        for tag in self._normalize_tags(tags):
+            if optim_context.has_optimizer(tag):
+                # param_info will check optimizer has not been set
+                param_info.optimizer = optim_context.get_optimizer(tag)
+        if not param_info.optimizer and optim_context.has_optimizer(DEFAULT_OPTIM):
+            param_info.optimizer = optim_context.get_optimizer(DEFAULT_OPTIM)
+
+        self._parameters_info[param_name] = param_info
+        # Add param to legacy structs as well, so all other functions for
+        # parameters are still working.
+        self.AddParameter(param_info.blob, tags)
         return param_info.blob
 
     def get_param_info(self, param):
@@ -155,11 +236,11 @@ class ModelHelper(object):
     def add_param_DEPRECATED(self, param, key=None, shape=None, length=None):
         logging.warning("add_param method is DEPRECATED")
         self._update_param_info_deprecated()
+        self.AddParameter(param)
         if key is not None and self.net.input_record() is not None:
             idx = self.net.input_record().field_blobs().index(key)
             key = self.net.input_record().field_names()[idx]
         shape = shape if shape is not None else self._infer_param_shape(param)
-        self.params.append(param)
         if not isinstance(param, core.BlobReference):
             raise ValueError("Param %s must be a BlobReference!" % str(param))
         self._param_info_deprecated.append(parameter_info.ParameterInfo(
@@ -187,15 +268,33 @@ class ModelHelper(object):
         else:
             return self._param_info_deprecated
 
+    def AddParameter(self, param, tags=None):
+        assert isinstance(param, core.BlobReference)
+        tags = self._normalize_tags(tags)
+        if parameter_info.ParameterTags.COMPUTED_PARAM in tags:
+            self._computed_params.append(param)
+        else:
+            self.params.append(param)
+
+        if parameter_info.ParameterTags.WEIGHT in tags:
+            self.weights.append(param)
+        if parameter_info.ParameterTags.BIAS in tags:
+            self.biases.append(param)
+
+    @staticmethod
+    def _NormalizeNamescope(namescope):
+        if namescope is None:
+            return scope.CurrentNameScope()
+        elif namescope == '' or namescope.endswith(scope._NAMESCOPE_SEPARATOR):
+            return namescope
+        else:
+            return namescope + scope._NAMESCOPE_SEPARATOR
+
     def GetParams(self, namescope=None, top_scope=False):
         '''
         Returns the params in current namescope
         '''
-        if namescope is None:
-            namescope = scope.CurrentNameScope()
-        else:
-            if not namescope.endswith(scope._NAMESCOPE_SEPARATOR):
-                namescope += scope._NAMESCOPE_SEPARATOR
+        namescope = ModelHelper._NormalizeNamescope(namescope)
 
         if namescope == '':
             return self.params[:]
@@ -276,7 +375,7 @@ class ModelHelper(object):
             param_to_grad = self.get_param_to_grad(params)
 
         return [
-            self.get_param_info(param) for param, grad in param_to_grad.items()
+            self.get_param_info(param) for param, grad in viewitems(param_to_grad)
             if (
                 not self.skip_sparse_optim or
                 not isinstance(grad, core.GradientSlice)
@@ -311,17 +410,13 @@ class ModelHelper(object):
         directly computed from data, such as the running mean and variance
         of Spatial Batch Normalization.
         '''
-        if namescope is None:
-            namescope = scope.CurrentNameScope()
-        else:
-            if not namescope.endswith(scope._NAMESCOPE_SEPARATOR):
-                namescope += scope._NAMESCOPE_SEPARATOR
+        namescope = ModelHelper._NormalizeNamescope(namescope)
 
         if namescope == '':
-            return self.computed_params[:]
+            return self._computed_params[:]
         else:
-            return [p for p in self.computed_params
-                    if p.GetNameScope() == namescope]
+            return [p for p in self._computed_params
+                    if p.GetNameScope().startswith(namescope)]
 
     def GetAllParams(self, namescope=None):
         return self.GetParams(namescope) + self.GetComputedParams(namescope)
@@ -363,10 +458,11 @@ class ModelHelper(object):
         return self.net.__getattr__(op_type)
 
     def __dir__(self):
-        return sorted(set(
-            dir(type(self)) +
-            self.__dict__.keys() +
-            _known_working_ops))
+        return sorted(set(chain(
+            dir(type(self)),
+            viewkeys(self.__dict__),
+            _known_working_ops
+        )))
 
 
 def ExtractPredictorNet(
@@ -375,7 +471,7 @@ def ExtractPredictorNet(
     output_blobs,
     device=None,
     renames=None,
-    disabled_inputs=None
+    disabled_inputs=None,
 ):
     '''
     Takes a model net for training and returns a net which can be
@@ -399,6 +495,9 @@ def ExtractPredictorNet(
     output_blobs = {str(b) for b in output_blobs}
     external_inputs = set(input_blobs)
     external_outputs = set(output_blobs)
+
+    if renames is None:
+        renames = {}
 
     if disabled_inputs is not None:
         known_blobs = known_blobs - set(disabled_inputs)
@@ -432,15 +531,55 @@ def ExtractPredictorNet(
         for arg in op.arg:
             if arg.name == "is_test" and arg.i == 0:
                 raise Exception(
-                    "A operator had is_test=0, did you try to extract a " +
+                    "An operator had is_test=0, did you try to extract a " +
                     "predictor from a train model (instead of test model)?" +
                     " Op was: {}".format(str(op))
                 )
+
+    def rename_list(proto_list):
+        # proto lists don't support assignments
+        new_list = proto_list[:]
+        for j, b in enumerate(new_list):
+            if b in renames:
+                new_list[j] = renames[b]
+
+        del proto_list[:]
+        proto_list.extend(new_list)
 
     # Iterate through the ops and only include those whose inputs
     # we can satisfy.
     for op in ops[first_op_with_input:(last_op_with_output + 1)]:
         if known_blobs.issuperset(op.input):
+
+            # Special handling for recurrent nets
+            # TODO: when standard argument type for "nets" is introduced,
+            # this can be more general
+            if op.type == 'RecurrentNetwork':
+                import google.protobuf.text_format as protobuftx
+                for arg in op.arg:
+                    if arg.name == 'backward_step_net':
+                        arg.s = b""
+                    elif arg.name == 'step_net':
+                        step_proto = caffe2_pb2.NetDef()
+                        protobuftx.Merge(arg.s.decode("ascii"), step_proto)
+                        for step_op in step_proto.op:
+                            rename_list(step_op.input)
+                            rename_list(step_op.output)
+                            if device is not None:
+                                step_op.device_option.device_type = device.device_type
+                                step_op.device_option.cuda_gpu_id = device.cuda_gpu_id
+
+                        rename_list(step_proto.external_input)
+                        rename_list(step_proto.external_output)
+
+                        # Add additional external inputs
+                        external_inputs.update(
+                            set(step_proto.external_input).intersection(
+                                orig_external_inputs
+                            )
+                        )
+                        arg.s = str(step_proto).encode("ascii")
+
             if device is not None:
                 op.device_option.device_type = device.device_type
                 op.device_option.cuda_gpu_id = device.cuda_gpu_id
@@ -453,25 +592,13 @@ def ExtractPredictorNet(
             external_outputs.update(
                 set(op.output).intersection(orig_external_outputs)
             )
+
         else:
             logging.debug(
                 "Op {} had unknown inputs: {}".format(
                     op.type, set(op.input).difference(known_blobs)
                 )
             )
-
-    def rename_list(proto_list):
-        if renames is None:
-            return
-
-        # proto lists don't support assignments
-        new_list = proto_list[:]
-        for j, b in enumerate(new_list):
-            if b in renames:
-                new_list[j] = renames[b]
-
-        del proto_list[:]
-        proto_list.extend(new_list)
 
     # Predictor net's external inputs and outputs include only those
     # that are part of this net.
@@ -481,8 +608,17 @@ def ExtractPredictorNet(
     rename_list(predict_proto.external_input)
     rename_list(predict_proto.external_output)
 
+    renamed_input_blobs = []
+    for b in input_blobs:
+        if b in renames:
+            renamed_input_blobs.append(renames[b])
+        else:
+            renamed_input_blobs.append(b)
+
     for op in predict_proto.op:
         rename_list(op.input)
         rename_list(op.output)
 
-    return predict_net
+    return predict_net, list(
+        set(predict_proto.external_input) - set(renamed_input_blobs)
+    )

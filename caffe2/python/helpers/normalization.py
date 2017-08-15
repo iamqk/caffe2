@@ -6,6 +6,7 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 from caffe2.python import core, scope
+from caffe2.python.modeling.parameter_info import ParameterTags
 from caffe2.proto import caffe2_pb2
 
 
@@ -54,9 +55,8 @@ def instance_norm(model, blob_in, blob_out, dim_in, order="NCHW", **kwargs):
             [], blob_out + "_" + suffix, shape=[dim_in], value=value)
     scale, bias = init_blob(1.0, "s"), init_blob(0.0, "b")
 
-    model.params.extend([scale, bias])
-    model.weights.append(scale)
-    model.biases.append(bias)
+    model.AddParameter(scale, ParameterTags.WEIGHT)
+    model.AddParameter(bias, ParameterTags.BIAS)
     blob_outs = [blob_out, blob_out + "_sm", blob_out + "_siv"]
     if 'is_test' in kwargs and kwargs['is_test']:
         blob_outputs = model.net.InstanceNorm(
@@ -71,13 +71,14 @@ def instance_norm(model, blob_in, blob_out, dim_in, order="NCHW", **kwargs):
         return blob_outputs[0]
 
 
-def spatial_bn(model, blob_in, blob_out, dim_in, order="NCHW", **kwargs):
+def spatial_bn(model, blob_in, blob_out, dim_in,
+               init_scale=1., init_bias=0., order="NCHW", **kwargs):
     blob_out = blob_out or model.net.NextName()
     # Input: input, scale, bias, est_mean, est_inv_var
     # Output: output, running_mean, running_inv_var, saved_mean,
     #         saved_inv_var
-    # scale: initialize with ones
-    # bias: initialize with zeros
+    # scale: initialize with init_scale (default 1.)
+    # bias: initialize with init_bias (default 0.)
     # est mean: zero
     # est var: ones
 
@@ -86,7 +87,7 @@ def spatial_bn(model, blob_in, blob_out, dim_in, order="NCHW", **kwargs):
             [], blob_out + "_" + suffix, shape=[dim_in], value=value)
 
     if model.init_params:
-        scale, bias = init_blob(1.0, "s"), init_blob(0.0, "b")
+        scale, bias = init_blob(init_scale, "s"), init_blob(init_bias, "b")
         running_mean = init_blob(0.0, "rm")
         running_inv_var = init_blob(1.0, "riv")
     else:
@@ -99,10 +100,11 @@ def spatial_bn(model, blob_in, blob_out, dim_in, order="NCHW", **kwargs):
         running_inv_var = core.ScopedBlobReference(
             blob_out + '_riv', model.param_init_net)
 
-    model.params.extend([scale, bias])
-    model.computed_params.extend([running_mean, running_inv_var])
-    model.weights.append(scale)
-    model.biases.append(bias)
+    model.AddParameter(running_mean, ParameterTags.COMPUTED_PARAM)
+    model.AddParameter(running_inv_var, ParameterTags.COMPUTED_PARAM)
+    model.AddParameter(scale, ParameterTags.WEIGHT)
+    model.AddParameter(bias, ParameterTags.BIAS)
+
     blob_outs = [blob_out, running_mean, running_inv_var,
                  blob_out + "_sm", blob_out + "_siv"]
     if 'is_test' in kwargs and kwargs['is_test']:

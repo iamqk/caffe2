@@ -5,7 +5,6 @@ from __future__ import print_function
 import numpy as np
 from hypothesis import given, assume
 import hypothesis.strategies as st
-from itertools import izip
 
 from caffe2.python import core, model_helper
 import caffe2.python.hypothesis_test_util as hu
@@ -14,7 +13,7 @@ import caffe2.python.hypothesis_test_util as hu
 class TestLeakyRelu(hu.HypothesisTestCase):
 
     def _get_inputs(self, N, C, H, W, order):
-        input_data = np.random.rand(N, C, H, W).astype(np.float32)
+        input_data = np.random.rand(N, C, H, W).astype(np.float32) - 0.5
 
         # default step size is 0.05
         input_data[np.logical_and(
@@ -39,7 +38,7 @@ class TestLeakyRelu(hu.HypothesisTestCase):
 
     def _feed_inputs(self, input_blobs, device_option):
         names = ['input', 'scale', 'bias']
-        for name, blob in izip(names, input_blobs):
+        for name, blob in zip(names, input_blobs):
             self.ws.create_blob(name).feed(blob, device_option=device_option)
 
     @given(gc=hu.gcs['gc'],

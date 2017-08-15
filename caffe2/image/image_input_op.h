@@ -1,3 +1,5 @@
+// Copyright 2004-present Facebook. All Rights Reserved.
+
 #ifndef CAFFE2_IMAGE_IMAGE_INPUT_OP_H_
 #define CAFFE2_IMAGE_IMAGE_INPUT_OP_H_
 
@@ -20,6 +22,14 @@ class CUDAContext;
 template <class Context>
 class ImageInputOp final
     : public PrefetchOperator<Context> {
+  // SINGLE_LABEL: single integer label for multi-class classification
+  // MULTI_LABEL_SPARSE: sparse active label indices for multi-label classification
+  // MULTI_LABEL_DENSE: dense label embedding vector for label embedding regression
+  enum LABEL_TYPE {
+    SINGLE_LABEL = 0,
+    MULTI_LABEL_SPARSE = 1,
+    MULTI_LABEL_DENSE = 2
+  };
  public:
   using OperatorBase::OutputSize;
   using PrefetchOperator<Context>::context_;
@@ -52,24 +62,26 @@ class ImageInputOp final
   bool GetImageAndLabelAndInfoFromDBValue(
       const string& value, cv::Mat* img, PerImageArg& info, int item_id);
   void DecodeAndTransform(
-      const std::string value, float *image_data, int item_id,
-      const int channels, std::mt19937 *randgen,
-      std::bernoulli_distribution *mirror_this_image);
+      const std::string& value, float *image_data, int item_id,
+      const int channels, std::size_t thread_index);
   void DecodeAndTransposeOnly(
-      const std::string value, uint8_t *image_data, int item_id,
-      const int channels, std::mt19937 *randgen,
-      std::bernoulli_distribution *mirror_this_image);
+      const std::string& value, uint8_t *image_data, int item_id,
+      const int channels, std::size_t thread_index);
 
   unique_ptr<db::DBReader> owned_reader_;
   const db::DBReader* reader_;
   CPUContext cpu_context_;
   TensorCPU prefetched_image_;
   TensorCPU prefetched_label_;
+  vector<TensorCPU> prefetched_additional_outputs_;
   Tensor<Context> prefetched_image_on_device_;
   Tensor<Context> prefetched_label_on_device_;
+  vector<Tensor<Context>> prefetched_additional_outputs_on_device_;
   // Default parameters for images
   PerImageArg default_arg_;
   int batch_size_;
+  LABEL_TYPE label_type_;
+  int num_labels_;
   bool color_;
   int scale_;
   // Minsize is similar to scale except that it will only
@@ -86,6 +98,7 @@ class ImageInputOp final
   bool is_test_;
   bool use_caffe_datum_;
   bool gpu_transform_;
+  bool mean_std_copied_ = false;
 
   // thread pool for parse + decode
   int num_decode_threads_;
@@ -93,32 +106,43 @@ class ImageInputOp final
 
   // Output type for GPU transform path
   TensorProto_DataType output_type_;
+
+  // Working variables
+  std::vector<std::mt19937> randgen_per_thread_;
 };
 
 template <class Context>
 ImageInputOp<Context>::ImageInputOp(
-      const OperatorDef& operator_def, Workspace* ws)
-      : PrefetchOperator<Context>(operator_def, ws),
-        reader_(nullptr),
-        batch_size_(
-            OperatorBase::template GetSingleArgument<int>("batch_size", 0)),
-        color_(OperatorBase::template GetSingleArgument<int>("color", 1)),
-        scale_(OperatorBase::template GetSingleArgument<int>("scale", -1)),
-        minsize_(OperatorBase::template GetSingleArgument<int>("minsize", -1)),
-        warp_(OperatorBase::template GetSingleArgument<int>("warp", 0)),
-        crop_(OperatorBase::template GetSingleArgument<int>("crop", -1)),
-        mirror_(OperatorBase::template GetSingleArgument<int>("mirror", 0)),
-        is_test_(OperatorBase::template GetSingleArgument<int>("is_test", 0)),
-        use_caffe_datum_(OperatorBase::template GetSingleArgument<int>(
-              "use_caffe_datum", 0)),
-        gpu_transform_(OperatorBase::template GetSingleArgument<int>(
-              "use_gpu_transform", 0)),
-        num_decode_threads_(OperatorBase::template GetSingleArgument<int>(
-              "decode_threads", 4)),
-        thread_pool_(new TaskThreadPool(num_decode_threads_)),
-        // output type only supported with CUDA and use_gpu_transform for now
-        output_type_(cast::GetCastDataType(this->arg_helper(), "output_type"))
-{
+    const OperatorDef& operator_def,
+    Workspace* ws)
+    : PrefetchOperator<Context>(operator_def, ws),
+      reader_(nullptr),
+      prefetched_additional_outputs_(OutputSize() - 2),
+      prefetched_additional_outputs_on_device_(OutputSize() - 2),
+      batch_size_(
+          OperatorBase::template GetSingleArgument<int>("batch_size", 0)),
+      label_type_(static_cast<LABEL_TYPE>(
+        OperatorBase::template GetSingleArgument<int>("label_type", 0))),
+      num_labels_(
+          OperatorBase::template GetSingleArgument<int>("num_labels", 0)),
+      color_(OperatorBase::template GetSingleArgument<int>("color", 1)),
+      scale_(OperatorBase::template GetSingleArgument<int>("scale", -1)),
+      minsize_(OperatorBase::template GetSingleArgument<int>("minsize", -1)),
+      warp_(OperatorBase::template GetSingleArgument<int>("warp", 0)),
+      crop_(OperatorBase::template GetSingleArgument<int>("crop", -1)),
+      mirror_(OperatorBase::template GetSingleArgument<int>("mirror", 0)),
+      is_test_(OperatorBase::template GetSingleArgument<int>("is_test", 0)),
+      use_caffe_datum_(
+          OperatorBase::template GetSingleArgument<int>("use_caffe_datum", 0)),
+      gpu_transform_(OperatorBase::template GetSingleArgument<int>(
+          "use_gpu_transform",
+          0)),
+      num_decode_threads_(
+          OperatorBase::template GetSingleArgument<int>("decode_threads", 4)),
+      thread_pool_(std::make_shared<TaskThreadPool>(num_decode_threads_)),
+      // output type only supported with CUDA and use_gpu_transform for now
+      output_type_(
+          cast::GetCastDataType(ArgumentHelper(operator_def), "output_type")) {
   mean_ = OperatorBase::template GetRepeatedArgument<float>(
     "mean_per_channel",
     {OperatorBase::template GetSingleArgument<float>("mean", 0.)});
@@ -126,6 +150,10 @@ ImageInputOp<Context>::ImageInputOp(
   std_ = OperatorBase::template GetRepeatedArgument<float>(
     "std_per_channel",
     {OperatorBase::template GetSingleArgument<float>("std", 1.)});
+
+  vector<int> additional_output_sizes =
+      OperatorBase::template GetRepeatedArgument<int>(
+          "output_sizes", vector<int>(OutputSize() - 2, 1));
 
   default_arg_.bounding_params = {
     false,
@@ -149,6 +177,14 @@ ImageInputOp<Context>::ImageInputOp(
     reader_ = owned_reader_.get();
   }
   CAFFE_ENFORCE_GT(batch_size_, 0, "Batch size should be nonnegative.");
+  if (use_caffe_datum_) {
+    CAFFE_ENFORCE_EQ(label_type_, SINGLE_LABEL,
+      "Caffe datum only supports single integer label");
+  }
+  if (label_type_ !=  SINGLE_LABEL) {
+    CAFFE_ENFORCE_GT(num_labels_, 0,
+      "Number of labels must be set for using either sparse label indices or dense label embedding.");
+  }
   CAFFE_ENFORCE((scale_ > 0) != (minsize_ > 0),
                 "Must provide one and only one of scaling or minsize");
   CAFFE_ENFORCE_GT(crop_, 0, "Must provide the cropping value.");
@@ -162,6 +198,13 @@ ImageInputOp<Context>::ImageInputOp(
       "The mean and std. dev vectors must be of the same size.");
   CAFFE_ENFORCE(mean_.size() == 1 || mean_.size() == 3,
                 "The mean and std. dev vectors must be of size 1 or 3");
+  CAFFE_ENFORCE(
+      !use_caffe_datum_ || OutputSize() == 2,
+      "There can only be 2 outputs if the Caffe datum format is used");
+  CAFFE_ENFORCE(
+      additional_output_sizes.size() == OutputSize() - 2,
+      "If the output sizes are specified, they must be specified for all "
+      "additional outputs");
 
   if (default_arg_.bounding_params.ymin < 0
       || default_arg_.bounding_params.xmin < 0
@@ -223,26 +266,25 @@ ImageInputOp<Context>::ImageInputOp(
   LOG(INFO) << "    Outputting images as "
             << OperatorBase::template GetSingleArgument<string>("output_type", "unknown") << ".";
 
-  if (gpu_transform_) {
-    if (!std::is_same<Context, CUDAContext>::value) {
-      throw std::runtime_error("use_gpu_transform only for GPUs");
-    } else {
-      mean_gpu_.Resize(mean_.size());
-      std_gpu_.Resize(std_.size());
-
-      context_.template Copy<float, CPUContext, Context>(
-        mean_.size(), mean_.data(), mean_gpu_.template mutable_data<float>());
-      context_.template Copy<float, CPUContext, Context>(
-        std_.size(), std_.data(), std_gpu_.template mutable_data<float>());
-    }
+  std::mt19937 meta_randgen(time(nullptr));
+  for (int i = 0; i < num_decode_threads_; ++i) {
+    randgen_per_thread_.emplace_back(meta_randgen());
   }
-
   prefetched_image_.Resize(
       TIndex(batch_size_),
       TIndex(crop_),
       TIndex(crop_),
       TIndex(color_ ? 3 : 1));
-  prefetched_label_.Resize(vector<TIndex>(1, batch_size_));
+  if (label_type_ != SINGLE_LABEL) {
+    prefetched_label_.Resize(TIndex(batch_size_), TIndex(num_labels_));
+  } else {
+    prefetched_label_.Resize(vector<TIndex>(1, batch_size_));
+  }
+
+  for (int i = 0; i < additional_output_sizes.size(); ++i) {
+    prefetched_additional_outputs_[i].Resize(
+        TIndex(batch_size_), TIndex(additional_output_sizes[i]));
+  }
 }
 
 template <class Context>
@@ -307,9 +349,15 @@ bool ImageInputOp<Context>::GetImageAndLabelAndInfoFromDBValue(
     CAFFE_ENFORCE(protos.ParseFromString(value));
     const TensorProto& image_proto = protos.protos(0);
     const TensorProto& label_proto = protos.protos(1);
-    if (protos.protos_size() == 3) {
+    vector<TensorProto> additional_output_protos;
+
+    for (int i = 2; i < OutputSize(); ++i) {
+      additional_output_protos.push_back(protos.protos(i));
+    }
+
+    if (protos.protos_size() == OutputSize() + 1) {
       // We have bounding box information
-      const TensorProto& bounding_proto = protos.protos(2);
+      const TensorProto& bounding_proto = protos.protos(OutputSize());
       DCHECK_EQ(bounding_proto.data_type(), TensorProto::INT32);
       DCHECK_EQ(bounding_proto.int32_data_size(), 4);
       info.bounding_params.valid = true;
@@ -350,17 +398,75 @@ bool ImageInputOp<Context>::GetImageAndLabelAndInfoFromDBValue(
     }
 
     if (label_proto.data_type() == TensorProto::FLOAT) {
-      DCHECK_EQ(label_proto.float_data_size(), 1);
-
-      prefetched_label_.mutable_data<float>()[item_id] =
-          label_proto.float_data(0);
+      if (label_type_ == SINGLE_LABEL) {
+        DCHECK_EQ(label_proto.float_data_size(), 1);
+        prefetched_label_.mutable_data<float>()[item_id] =
+            label_proto.float_data(0);
+      } else if (label_type_ == MULTI_LABEL_SPARSE) {
+        float* label_data = prefetched_label_.mutable_data<float>() +
+          item_id * num_labels_;
+        memset(label_data, 0, sizeof(float) * num_labels_);
+        for (int i = 0; i < label_proto.float_data_size(); ++i) {
+          label_data[(int)label_proto.float_data(i)] = 1.0;
+        }
+      } else if (label_type_ == MULTI_LABEL_DENSE) {
+        CAFFE_ENFORCE(label_proto.float_data_size() == num_labels_);
+        float* label_data = prefetched_label_.mutable_data<float>() +
+          item_id * num_labels_;
+        for (int i = 0; i < label_proto.float_data_size(); ++i) {
+          label_data[i] = label_proto.float_data(i);
+        }
+      } else {
+        LOG(ERROR) << "Unknown label type:" << label_type_;
+      }
     } else if (label_proto.data_type() == TensorProto::INT32) {
-      DCHECK_EQ(label_proto.int32_data_size(), 1);
-
-      prefetched_label_.mutable_data<int>()[item_id] =
-          label_proto.int32_data(0);
+      if (label_type_ == SINGLE_LABEL) {
+        DCHECK_EQ(label_proto.int32_data_size(), 1);
+        prefetched_label_.mutable_data<int>()[item_id] =
+            label_proto.int32_data(0);
+      } else if (label_type_ == MULTI_LABEL_SPARSE) {
+        int* label_data = prefetched_label_.mutable_data<int>() +
+          item_id * num_labels_;
+        memset(label_data, 0, sizeof(int) * num_labels_);
+        for (int i = 0; i < label_proto.int32_data_size(); ++i) {
+          label_data[label_proto.int32_data(i)] = 1;
+        }
+      } else if (label_type_ == MULTI_LABEL_DENSE) {
+        CAFFE_ENFORCE(label_proto.int32_data_size() == num_labels_);
+        int* label_data = prefetched_label_.mutable_data<int>() +
+          item_id * num_labels_;
+        for (int i = 0; i < label_proto.int32_data_size(); ++i) {
+          label_data[i] = label_proto.int32_data(i);
+        }
+      } else {
+        LOG(ERROR) << "Unknown label type:" << label_type_;
+      }
     } else {
-      LOG(FATAL) << "Unsupported label type.";
+      LOG(FATAL) << "Unsupported label data type.";
+    }
+
+    for (int i = 0; i < additional_output_protos.size(); ++i) {
+      auto additional_output_proto = additional_output_protos[i];
+
+      if (additional_output_proto.data_type() == TensorProto::FLOAT) {
+        float* additional_output =
+            prefetched_additional_outputs_[i].template mutable_data<float>() +
+            item_id * additional_output_proto.float_data_size();
+
+        for (int j = 0; j < additional_output_proto.float_data_size(); ++j) {
+          additional_output[j] = additional_output_proto.float_data(j);
+        }
+      } else if (additional_output_proto.data_type() == TensorProto::INT32) {
+        int* additional_output =
+            prefetched_additional_outputs_[i].template mutable_data<int>() +
+            item_id * additional_output_proto.int32_data_size();
+
+        for (int j = 0; j < additional_output_proto.int32_data_size(); ++j) {
+          additional_output[j] = additional_output_proto.int32_data(j);
+        }
+      } else {
+        LOG(FATAL) << "Unsupported output type.";
+      }
     }
   }
 
@@ -553,9 +659,14 @@ void CropTransposeImage(const cv::Mat& scaled_img, const int channels,
 // Intended as entry point for binding to thread pool
 template <class Context>
 void ImageInputOp<Context>::DecodeAndTransform(
-      const std::string value, float *image_data, int item_id,
-      const int channels, std::mt19937 *randgen,
-      std::bernoulli_distribution *mirror_this_image) {
+      const std::string& value, float *image_data, int item_id,
+      const int channels, std::size_t thread_index) {
+
+  CAFFE_ENFORCE((int)thread_index < num_decode_threads_);
+
+  std::bernoulli_distribution mirror_this_image(0.5f);
+  std::mt19937* randgen = &(randgen_per_thread_[thread_index]);
+
   cv::Mat img;
   // Decode the image
   PerImageArg info;
@@ -563,14 +674,18 @@ void ImageInputOp<Context>::DecodeAndTransform(
 
   // Factor out the image transformation
   TransformImage<Context>(img, channels, image_data, crop_, mirror_,
-                          mean_, std_, randgen, mirror_this_image, is_test_);
+                          mean_, std_, randgen, &mirror_this_image, is_test_);
 }
 
 template <class Context>
 void ImageInputOp<Context>::DecodeAndTransposeOnly(
-    const std::string value, uint8_t *image_data, int item_id,
-    const int channels, std::mt19937 *randgen,
-      std::bernoulli_distribution *mirror_this_image) {
+    const std::string& value, uint8_t *image_data, int item_id,
+    const int channels, std::size_t thread_index) {
+
+  CAFFE_ENFORCE((int)thread_index < num_decode_threads_);
+
+  std::bernoulli_distribution mirror_this_image(0.5f);
+  std::mt19937* randgen = &(randgen_per_thread_[thread_index]);
 
   cv::Mat img;
   // Decode the image
@@ -579,7 +694,7 @@ void ImageInputOp<Context>::DecodeAndTransposeOnly(
 
   // Factor out the image transformation
   CropTransposeImage<Context>(img, channels, image_data, crop_, mirror_,
-                              randgen, mirror_this_image, is_test_);
+                              randgen, &mirror_this_image, is_test_);
 }
 
 
@@ -602,15 +717,8 @@ bool ImageInputOp<Context>::Prefetch() {
 
   prefetched_label_.mutable_data<int>();
   // Prefetching handled with a thread pool of "decode_threads" threads.
-  std::mt19937 meta_randgen(time(nullptr));
-  std::vector<std::mt19937> randgen_per_thread;
-  for (int i = 0; i < num_decode_threads_; ++i) {
-    randgen_per_thread.emplace_back(meta_randgen());
-  }
 
-  std::bernoulli_distribution mirror_this_image(0.5);
   for (int item_id = 0; item_id < batch_size_; ++item_id) {
-    std::mt19937* randgen = &randgen_per_thread[item_id % num_decode_threads_];
     std::string key, value;
     cv::Mat img;
 
@@ -632,6 +740,20 @@ bool ImageInputOp<Context>::Prefetch() {
         } else {
           LOG(FATAL) << "Unsupported label type.";
         }
+
+        for (int i = 2; i < OutputSize(); ++i) {
+          TensorProto additional_output_proto = protos.protos(i);
+
+          if (additional_output_proto.data_type() == TensorProto::FLOAT) {
+            prefetched_additional_outputs_[i - 2]
+                .template mutable_data<float>();
+          } else if (
+              additional_output_proto.data_type() == TensorProto::INT32) {
+            prefetched_additional_outputs_[i - 2].template mutable_data<int>();
+          } else {
+            LOG(FATAL) << "Unsupported output type.";
+          }
+        }
       }
     }
 
@@ -640,27 +762,25 @@ bool ImageInputOp<Context>::Prefetch() {
       // output of decode will still be int8
       uint8_t* image_data = prefetched_image_.mutable_data<uint8_t>() +
           crop_ * crop_ * channels * item_id;
-      thread_pool_->runTask(std::bind(
+      thread_pool_->runTaskWithID(std::bind(
           &ImageInputOp<Context>::DecodeAndTransposeOnly,
           this,
           std::string(value),
           image_data,
           item_id,
           channels,
-          randgen,
-          &mirror_this_image));
+          std::placeholders::_1));
     } else {
       float* image_data = prefetched_image_.mutable_data<float>() +
           crop_ * crop_ * channels * item_id;
-      thread_pool_->runTask(std::bind(
+      thread_pool_->runTaskWithID(std::bind(
           &ImageInputOp<Context>::DecodeAndTransform,
           this,
           std::string(value),
           image_data,
           item_id,
           channels,
-          randgen,
-          &mirror_this_image));
+          std::placeholders::_1));
     }
   }
   thread_pool_->waitWorkComplete();
@@ -670,6 +790,11 @@ bool ImageInputOp<Context>::Prefetch() {
   if (!std::is_same<Context, CPUContext>::value) {
     prefetched_image_on_device_.CopyFrom(prefetched_image_, &context_);
     prefetched_label_on_device_.CopyFrom(prefetched_label_, &context_);
+
+    for (int i = 0; i < prefetched_additional_outputs_on_device_.size(); ++i) {
+      prefetched_additional_outputs_on_device_[i].CopyFrom(
+          prefetched_additional_outputs_[i], &context_);
+    }
   }
   return true;
 }
@@ -678,13 +803,35 @@ template <class Context>
 bool ImageInputOp<Context>::CopyPrefetched() {
   auto* image_output = OperatorBase::Output<Tensor<Context> >(0);
   auto* label_output = OperatorBase::Output<Tensor<Context> >(1);
+  vector<Tensor<Context>*> additional_outputs_output;
+
+  for (int i = 2; i < OutputSize(); ++i) {
+    additional_outputs_output.push_back(
+        OperatorBase::Output<Tensor<Context>>(i));
+  }
+
   // Note(jiayq): The if statement below should be optimized away by the
   // compiler since std::is_same is a constexpr.
   if (std::is_same<Context, CPUContext>::value) {
     image_output->CopyFrom(prefetched_image_, &context_);
     label_output->CopyFrom(prefetched_label_, &context_);
+
+    for (int i = 0; i < additional_outputs_output.size(); ++i) {
+      additional_outputs_output[i]->CopyFrom(
+          prefetched_additional_outputs_[i], &context_);
+    }
   } else {
     if (gpu_transform_) {
+      if (!mean_std_copied_) {
+        mean_gpu_.Resize(mean_.size());
+        std_gpu_.Resize(std_.size());
+
+        context_.template Copy<float, CPUContext, Context>(
+          mean_.size(), mean_.data(), mean_gpu_.template mutable_data<float>());
+        context_.template Copy<float, CPUContext, Context>(
+          std_.size(), std_.data(), std_gpu_.template mutable_data<float>());
+        mean_std_copied_ = true;
+      }
       // GPU transform kernel allows explicitly setting output type
       if (output_type_ == TensorProto_DataType_FLOAT) {
         TransformOnGPU<uint8_t,float,Context>(prefetched_image_on_device_,
@@ -701,6 +848,11 @@ bool ImageInputOp<Context>::CopyPrefetched() {
       image_output->CopyFrom(prefetched_image_on_device_, &context_);
     }
     label_output->CopyFrom(prefetched_label_on_device_, &context_);
+
+    for (int i = 0; i < additional_outputs_output.size(); ++i) {
+      additional_outputs_output[i]->CopyFrom(
+          prefetched_additional_outputs_on_device_[i], &context_);
+    }
   }
   return true;
 }

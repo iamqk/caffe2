@@ -28,10 +28,12 @@ add_subdirectory(video)
 add_subdirectory(mkl)
 add_subdirectory(mpi)
 add_subdirectory(operators)
+add_subdirectory(perfkernels)
 add_subdirectory(python)
 add_subdirectory(queue)
 add_subdirectory(sgd)
 # add_subdirectory(test) # todo: use caffe2_gtest_main instead of gtest_main because we will need to call GlobalInit
+add_subdirectory(transforms)
 add_subdirectory(utils)
 
 # Advanced: if we have white list specified, we will do intersections for all
@@ -84,6 +86,9 @@ else()
   caffe_add_whole_archive_flag(Caffe2_CPU tmp)
   list(APPEND Caffe2_MAIN_LIBS ${tmp})
 endif()
+if (Caffe2_EXTERNAL_DEPENDENCIES)
+  add_dependencies(Caffe2_CPU ${Caffe2_EXTERNAL_DEPENDENCIES})
+endif()
 
 # Write the macros file.
 file(MAKE_DIRECTORY ${PROJECT_BINARY_DIR}/caffe2/core)
@@ -120,8 +125,12 @@ if(USE_CUDA)
     caffe_add_whole_archive_flag(Caffe2_GPU tmp)
     list(APPEND Caffe2_MAIN_LIBS ${tmp})
   endif()
+  if (Caffe2_EXTERNAL_DEPENDENCIES)
+    add_dependencies(Caffe2_GPU ${Caffe2_EXTERNAL_DEPENDENCIES})
+  endif()
   install(TARGETS Caffe2_GPU DESTINATION ${CMAKE_INSTALL_PREFIX}/lib)
   link_directories(${CMAKE_INSTALL_PREFIX}/lib)
+  add_dependencies(Caffe2_GPU Caffe2_PROTO)
 endif()
 
 # ---[ Test binaries.
@@ -202,7 +211,7 @@ if (BUILD_PYTHON)
         ${CMAKE_INSTALL_PREFIX}/caffe2/python)
   endif()
 
-  if (MSVC)
+  if (MSVC AND CMAKE_GENERATOR MATCHES "Visual Studio")
     # If we are building under windows, we will copy the file from
     # build/caffe2/python/{Debug,Release}/caffe2_pybind11_state.pyd
     # to its parent folder so that we can do in-build execution.
@@ -211,14 +220,14 @@ if (BUILD_PYTHON)
     add_custom_command(
         TARGET windows_python_copy_lib POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy
-        ${CMAKE_BINARY_DIR}/caffe2/python/${CMAKE_BUILD_TYPE}/caffe2_pybind11_state.pyd
+        $<TARGET_FILE:caffe2_pybind11_state>
         ${CMAKE_BINARY_DIR}/caffe2/python)
     if (USE_CUDA)
       add_dependencies(windows_python_copy_lib caffe2_pybind11_state_gpu)
       add_custom_command(
           TARGET windows_python_copy_lib POST_BUILD
           COMMAND ${CMAKE_COMMAND} -E copy
-          ${CMAKE_BINARY_DIR}/caffe2/python/${CMAKE_BUILD_TYPE}/caffe2_pybind11_state_gpu.pyd
+          $<TARGET_FILE:caffe2_pybind11_state_gpu>
           ${CMAKE_BINARY_DIR}/caffe2/python)
     endif()
   endif()
@@ -233,13 +242,28 @@ if (BUILD_PYTHON)
   file(GLOB_RECURSE PYTHON_SRCS RELATIVE ${PROJECT_SOURCE_DIR}
        "${PROJECT_SOURCE_DIR}/caffe2/*.py")
   add_custom_target(python_copy_files ALL)
-  foreach(python_src ${PYTHON_SRCS})
-    get_filename_component(dir ${python_src} DIRECTORY)
-    add_custom_command(
-        TARGET python_copy_files PRE_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy
-        ${PROJECT_SOURCE_DIR}/${python_src} ${CMAKE_BINARY_DIR}/${dir})
-  endforeach()
+  if(MSVC AND CMAKE_GENERATOR MATCHES "Ninja")
+    # ninja fails when the command line is too long so we split
+    # the target into several. This would be beneficial for VS also
+    # since it build targets in parallel but not custom commands
+    foreach(python_src ${PYTHON_SRCS})
+      get_filename_component(dir ${python_src} DIRECTORY)
+      string(SHA1 name_hash "${python_src}")
+      # get_filename_component(name_we ${python_src} NAME_WE)
+      add_custom_target(python_copy_files_${name_hash}
+          COMMAND ${CMAKE_COMMAND} -E copy
+          ${PROJECT_SOURCE_DIR}/${python_src} ${CMAKE_BINARY_DIR}/${dir})
+      add_dependencies(python_copy_files python_copy_files_${name_hash})
+    endforeach()
+  else()
+    foreach(python_src ${PYTHON_SRCS})
+      get_filename_component(dir ${python_src} DIRECTORY)
+      add_custom_command(
+          TARGET python_copy_files PRE_BUILD
+          COMMAND ${CMAKE_COMMAND} -E copy
+          ${PROJECT_SOURCE_DIR}/${python_src} ${CMAKE_BINARY_DIR}/${dir})
+    endforeach()
+  endif()
 
   # Install commands
   # Pick up static python files
@@ -259,4 +283,3 @@ endif()
 if (BUILD_BINARY)
   add_subdirectory(binaries)
 endif()
-

@@ -98,7 +98,24 @@ int GetCurrentGPUID() {
 
 int GetGPUIDForPointer(const void* ptr) {
   cudaPointerAttributes attr;
-  CUDA_ENFORCE(cudaPointerGetAttributes(&attr, ptr));
+  cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+
+  if (err == cudaErrorInvalidValue) {
+    // Occurs when the pointer is in the CPU address space that is
+    // unmanaged by CUDA; make sure the last error state is cleared,
+    // since it is persistent
+    err = cudaGetLastError();
+    CHECK(err == cudaErrorInvalidValue);
+    return -1;
+  }
+
+  // Otherwise, there must be no error
+  CUDA_ENFORCE(err);
+
+  if (attr.memoryType == cudaMemoryTypeHost) {
+    return -1;
+  }
+
   return attr.device;
 }
 
@@ -174,6 +191,18 @@ bool GetCudaPeerAccessPattern(vector<vector<bool> >* pattern) {
     }
   }
   return true;
+}
+
+bool TensorCoreAvailable() {
+  // requires CUDA 9.0 and above
+#if CUDA_VERSION < 9000
+  return false;
+#else
+  int device = GetCurrentGPUID();
+  auto& prop = GetDeviceProperty(device);
+
+  return prop.major >= 7;
+#endif
 }
 
 const char* cublasGetErrorString(cublasStatus_t error) {

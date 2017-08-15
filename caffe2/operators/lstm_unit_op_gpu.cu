@@ -116,7 +116,7 @@ void LSTMUnit<float, CUDAContext>(
     bool drop_states,
     float* C,
     float* H,
-    const float& forget_bias,
+    const float forget_bias,
     CUDAContext* context) {
   LSTMUnitKernel<float><<<
       CAFFE_GET_BLOCKS(N * D),
@@ -177,10 +177,8 @@ void LSTMUnitGradient<float, CUDAContext>(
 }
 }
 
-namespace {
 REGISTER_CUDA_OPERATOR(LSTMUnit, LSTMUnitOp<float, CUDAContext>);
 REGISTER_CUDA_OPERATOR(
     LSTMUnitGradient,
     LSTMUnitGradientOp<float, CUDAContext>);
-}
 }

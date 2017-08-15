@@ -8,7 +8,7 @@ import os
 import unittest
 
 from caffe2.proto import caffe2_pb2
-from caffe2.python import core, test_util, workspace, cnn
+from caffe2.python import core, test_util, workspace, model_helper, brew
 
 import caffe2.python.hypothesis_test_util as htu
 import hypothesis.strategies as st
@@ -385,7 +385,6 @@ class TestCWorkspace(htu.HypothesisTestCase):
 
     @given(name=st.text(), value=st.floats(min_value=-1, max_value=1.0))
     def test_operator_run(self, name, value):
-        name = name.encode('ascii', 'ignore')
         ws = workspace.C.Workspace()
         op = core.CreateOperator(
             "ConstantFill", [], [name], shape=[1], value=value)
@@ -398,7 +397,6 @@ class TestCWorkspace(htu.HypothesisTestCase):
            net_name=st.text(),
            value=st.floats(min_value=-1, max_value=1.0))
     def test_net_run(self, blob_name, net_name, value):
-        blob_name = blob_name.encode('ascii', 'ignore')
         ws = workspace.C.Workspace()
         net = core.Net(net_name)
         net.ConstantFill([], [blob_name], shape=[1], value=value)
@@ -413,7 +411,6 @@ class TestCWorkspace(htu.HypothesisTestCase):
            plan_name=st.text(),
            value=st.floats(min_value=-1, max_value=1.0))
     def test_plan_run(self, blob_name, plan_name, net_name, value):
-        blob_name = blob_name.encode('ascii', 'ignore')
         ws = workspace.C.Workspace()
         plan = core.Plan(plan_name)
         net = core.Net(net_name)
@@ -431,7 +428,6 @@ class TestCWorkspace(htu.HypothesisTestCase):
            net_name=st.text(),
            value=st.floats(min_value=-1, max_value=1.0))
     def test_net_create(self, blob_name, net_name, value):
-        blob_name = blob_name.encode('ascii', 'ignore')
         ws = workspace.C.Workspace()
         net = core.Net(net_name)
         net.ConstantFill([], [blob_name], shape=[1], value=value)
@@ -475,12 +471,12 @@ class TestCWorkspace(htu.HypothesisTestCase):
 
 class TestPredictor(unittest.TestCase):
     def _create_model(self):
-        m = cnn.CNNModelHelper()
-        y = m.FC("data", "y",
-                 dim_in=4, dim_out=2,
-                 weight_init=m.ConstantInit(1.0),
-                 bias_init=m.ConstantInit(0.0),
-                 axis=0)
+        m = model_helper.ModelHelper()
+        y = brew.fc(m, "data", "y",
+                    dim_in=4, dim_out=2,
+                    weight_init=('ConstantFill', dict(value=1.0)),
+                    bias_init=('ConstantFill', dict(value=0.0)),
+                    axis=0)
         m.net.AddExternalOutput(y)
         return m
 
@@ -514,6 +510,44 @@ class TestPredictor(unittest.TestCase):
         outputs = self.predictor.run([inputs])
         np.testing.assert_array_almost_equal(
             np.array([[516, 516]], dtype='float32'), outputs)
+
+
+class TestTransform(htu.HypothesisTestCase):
+    @given(input_dim=st.integers(min_value=1, max_value=10),
+           output_dim=st.integers(min_value=1, max_value=10),
+           batch_size=st.integers(min_value=1, max_value=10))
+    def test_simple_transform(self, input_dim, output_dim, batch_size):
+        m = model_helper.ModelHelper()
+        fc1 = brew.fc(m, "data", "fc1", dim_in=input_dim, dim_out=output_dim)
+        fc2 = brew.fc(m, fc1, "fc2", dim_in=output_dim, dim_out=output_dim)
+        conv = brew.conv(m, fc2, "conv",
+                            dim_in=output_dim,
+                            dim_out=output_dim,
+                            use_cudnn=True,
+                            engine="CUDNN",
+                            kernel=3)
+
+        conv.Relu([], conv)\
+           .Softmax([], "pred") \
+           .LabelCrossEntropy(["label"], ["xent"]) \
+           .AveragedLoss([], "loss")
+
+        transformed_net_proto = workspace.ApplyTransform(
+            "ConvToNNPack",
+            m.net.Proto())
+
+        self.assertEqual(transformed_net_proto.op[2].engine, "NNPACK")
+
+    @given(input_dim=st.integers(min_value=1, max_value=10),
+           output_dim=st.integers(min_value=1, max_value=10),
+           batch_size=st.integers(min_value=1, max_value=10))
+    def test_registry_invalid(self, input_dim, output_dim, batch_size):
+        m = model_helper.ModelHelper()
+        brew.fc(m, "data", "fc1", dim_in=input_dim, dim_out=output_dim)
+        with self.assertRaises(RuntimeError):
+            workspace.ApplyTransform(
+                "definitely_not_a_real_transform",
+                m.net.Proto())
 
 
 if __name__ == '__main__':
